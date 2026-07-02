@@ -512,6 +512,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);overf
 <div id="settings-panel">
   <button id="close-settings-btn">✕</button>
   <h2 style="font-size:1.1rem;font-weight:700">Board Preferences</h2>
+  
   <div class="ss">
     <h3>Background Customizer</h3>
     <div id="bg-color-sw" class="swatch-row"></div>
@@ -522,6 +523,32 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);overf
       <span class="custom-lbl">Custom Canvas Background</span>
     </div>
   </div>
+
+  <div class="ss" id="slide-dims-container">
+    <h3>Slide Dimension & Ratio</h3>
+    <select id="slide-size-select">
+      <option value="16:9" selected>16:9 Widescreen (1280x720)</option>
+      <option value="4:3">4:3 Standard (1024x768)</option>
+      <option value="A4-P">A4 Portrait (794x1123)</option>
+      <option value="A4-L">A4 Landscape (1123x794)</option>
+      <option value="Letter-P">Letter Portrait (816x1056)</option>
+      <option value="Letter-L">Letter Landscape (1056x816)</option>
+      <option value="Square">Square (800x800)</option>
+      <option value="custom">Custom Canvas...</option>
+    </select>
+    <div class="custom-picker-row" id="custom-dims-row" style="display:none; margin-top:8px; flex-wrap:wrap; gap:8px;">
+      <div style="display:flex; align-items:center; gap:4px;">
+        <span class="custom-lbl" style="font-size: 0.7rem;">W:</span>
+        <input type="number" id="custom-slide-w" value="1280" min="200" max="4000" style="width:64px; padding:4px 6px;">
+      </div>
+      <div style="display:flex; align-items:center; gap:4px;">
+        <span class="custom-lbl" style="font-size: 0.7rem;">H:</span>
+        <input type="number" id="custom-slide-h" value="720" min="200" max="4000" style="width:64px; padding:4px 6px;">
+      </div>
+      <button class="btn btn-p" id="apply-custom-size-btn" style="padding:4px 8px; font-size:11px; margin-top:0;">Apply</button>
+    </div>
+  </div>
+
   <div class="ss">
     <h3>Pixel Eraser</h3>
     <div class="sr">
@@ -620,8 +647,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);overf
 });
 
 document.addEventListener('DOMContentLoaded', () => {
-const CANVAS_W=1280,CANVAS_H=720;
-const INFINITE_W=4000,INFINITE_H=3000;
+let CANVAS_W=1280,CANVAS_H=720;
+let INFINITE_W=4000,INFINITE_H=3000;
 const HLIMIT=60;
 const CPROPS=['isMath','isShape','sourceData','isEraserStroke','isPdfImage','isInverted','isHandwriting','isSticker','isHighlight','calloutText'];
 const LC=['#0f172a','#1e3a8a','#0f766e','#c2410c','#b91c1c','#6d28d9','#64748b'];
@@ -686,6 +713,16 @@ canvas=new fabric.Canvas('whiteboard-canvas',{
   enableRetinaScaling:true // High definition graphics tablet scaling!
 });
 
+// ── MODERN RESIZE & LAYOUT OBSERVER (PREVENTS TRANSITION DRIFTS & MISALIGNMENT)
+const wrapObserver = new ResizeObserver(() => {
+  cachedCanvasWrapRect = canvasWrap.getBoundingClientRect();
+  canvas.calcOffset();
+  if (!isInfiniteMode) {
+    centerCanvas();
+  }
+});
+wrapObserver.observe(canvasWrap);
+
 // ── ROBUST COORDINATE PROJECTION SYSTEM (ELIMINATES VIEWPORT WRITING DISTORTIONS)
 const nativeGetPointer = canvas.getPointer;
 canvas.getPointer = function(e, ignoreZoom) {
@@ -716,9 +753,13 @@ canvas.getPointer = function(e, ignoreZoom) {
 
 // ── LOCAL STORAGE PREFERENCES INTEGRATION
 function savePrefs(){
+  const sizeSelect = document.getElementById('slide-size-select');
   const prefs={
     activeColor,penThick,eraserSz,smoothnessLevel,
-    bgPat,bgSpacing,lightBg,darkBg,isDark
+    bgPat,bgSpacing,lightBg,darkBg,isDark,
+    slideW: CANVAS_W,
+    slideH: CANVAS_H,
+    slideSizeSelectVal: sizeSelect ? sizeSelect.value : '16:9'
   };
   localStorage.setItem('cledboard_prefs_v7', JSON.stringify(prefs));
 }
@@ -739,6 +780,21 @@ function loadPrefs(){
       lightBg=p.lightBg||'#ffffff';
       darkBg=p.darkBg||'#090d16';
       isDark=p.isDark||false;
+
+      // Restoring Custom Slide Resolutions on Launch
+      if (p.slideW && p.slideH) {
+        CANVAS_W = p.slideW;
+        CANVAS_H = p.slideH;
+        const selector = document.getElementById('slide-size-select');
+        if (selector && p.slideSizeSelectVal) {
+          selector.value = p.slideSizeSelectVal;
+          if (p.slideSizeSelectVal === 'custom') {
+            document.getElementById('custom-dims-row').style.display = 'flex';
+            document.getElementById('custom-slide-w').value = p.slideW;
+            document.getElementById('custom-slide-h').value = p.slideH;
+          }
+        }
+      }
     }catch(err){console.error("Local storage error:",err);}
   } else {
     isDark=false;
@@ -761,6 +817,79 @@ function applyTransform(){
   hostEl.style.transformOrigin='0 0';
   document.getElementById('zoom-display').textContent=Math.round(zoomLevel*100)+'%';
   canvas.calcOffset();
+
+  if (isInfiniteMode) {
+    adjustInfiniteCanvasBounds();
+  }
+}
+
+// ── DYNAMIC INFINITE CANVAS GROWING SYSTEM
+let isAdjustingBounds = false;
+function adjustInfiniteCanvasBounds() {
+  if (!isInfiniteMode || isAdjustingBounds) return;
+  
+  const wr = getCanvasWrapRect();
+  const topLeft = screenToCanvas(wr.left, wr.top);
+  const bottomRight = screenToCanvas(wr.right, wr.bottom);
+  
+  const padding = 1500; // Extend whiteboard coordinate space progressively
+  const triggerMargin = 400; // Extend canvas buffer when panning 400px near bounds
+  
+  let changed = false;
+  let shiftX = 0;
+  let shiftY = 0;
+  
+  let curW = canvas.getWidth();
+  let curH = canvas.getHeight();
+  
+  // Expand Canvas Space leftwards
+  if (topLeft.x < triggerMargin) {
+    shiftX = padding;
+    curW += padding;
+    changed = true;
+  }
+  // Expand Canvas Space upwards
+  if (topLeft.y < triggerMargin) {
+    shiftY = padding;
+    curH += padding;
+    changed = true;
+  }
+  // Expand Canvas Space rightwards
+  if (bottomRight.x > curW - triggerMargin) {
+    curW += padding;
+    changed = true;
+  }
+  // Expand Canvas Space downwards
+  if (bottomRight.y > curH - triggerMargin) {
+    curH += padding;
+    changed = true;
+  }
+  
+  if (changed) {
+    isAdjustingBounds = true;
+    try {
+      if (shiftX > 0 || shiftY > 0) {
+        // Offset coordinate system of drawn objects seamlessly
+        canvas.forEachObject(obj => {
+          obj.left += shiftX;
+          obj.top += shiftY;
+          obj.setCoords();
+        });
+        
+        // Counteract movement by altering panning offset: zero screen jitter
+        panX -= shiftX * zoomLevel;
+        panY -= shiftY * zoomLevel;
+      }
+      
+      canvas.setDimensions({ width: curW, height: curH });
+      canvas.calcOffset();
+      applyTransform();
+      applyBg(); // Regenerate grid spacing cleanly
+      canvas.requestRenderAll();
+    } finally {
+      isAdjustingBounds = false;
+    }
+  }
 }
 
 function centerCanvas(){
@@ -1193,7 +1322,7 @@ function toggleInfiniteWorkspace(){
     toggleBtn.title="Switch to Infinite Canvas";
     slideLabel.style.display='block';
 
-    // Shrink down back to fixed 16:9 layout limits
+    // Shrink down back to configured size layout limits
     canvas.setWidth(CANVAS_W);
     canvas.setHeight(CANVAS_H);
     hostEl.style.boxShadow='var(--shadow)';
@@ -1547,6 +1676,10 @@ function toggleDark(){
         o.set({ stroke: newBg, fill: newBg });
         return;
       }
+      if (o.isHighlight) {
+        // Highlighters preserve their semi-transparent contrast natively!
+        return;
+      }
       if (o.stroke && o.stroke !== 'transparent') {
         o.set('stroke', getThemeMappedColor(o.stroke, isDark));
       }
@@ -1579,6 +1712,9 @@ function toggleDark(){
         if (o.isEraserStroke) {
           o.stroke = newBg; o.fill = newBg; return;
         }
+        if (o.isHighlight) {
+          return; // Skip theme color changes on highlighters
+        }
         if ((o.isPdfImage || (o.type === 'image' && !o.isPdfImage)) && invertMedia) {
           o.isInverted = !o.isInverted;
           o.filters = o.isInverted ? [{ type: 'Invert' }] : [];
@@ -1598,6 +1734,7 @@ function toggleDark(){
         const updatedHist = JSON.parse(JSON.stringify(histData));
         updatedHist.objects.forEach(o => {
           if (o.isEraserStroke) { o.stroke = newBg; o.fill = newBg; return; }
+          if (o.isHighlight) return;
           if ((o.isPdfImage || (o.type === 'image' && !o.isPdfImage)) && invertMedia) {
             o.isInverted = !o.isInverted; o.filters = o.isInverted ? [{ type: 'Invert' }] : []; return;
           }
@@ -1614,6 +1751,7 @@ function toggleDark(){
       if (infiniteCanvasState.objects) {
         infiniteCanvasState.objects.forEach(o => {
           if (o.isEraserStroke) { o.stroke = newBg; o.fill = newBg; return; }
+          if (o.isHighlight) return;
           if ((o.isPdfImage || (o.type === 'image' && !o.isPdfImage)) && invertMedia) {
             o.isInverted = !o.isInverted; o.filters = o.isInverted ? [{ type: 'Invert' }] : []; return;
           }
@@ -1746,10 +1884,39 @@ async function importPDF(file){
   finally{URL.revokeObjectURL(url);}
 }
 
-async function exportPDF(){
+// ── CUSTOM QUALITY EXPORT MODAL SELECTOR
+function openPdfExportModal() {
+  const bodyHtml = `
+    <div class="field">
+      <label for="pdf-quality-select" style="font-weight: 600; margin-bottom: 6px; display: block;">PDF Export Quality / Resolution Multiplier</label>
+      <select id="pdf-quality-select" style="width:100%; padding:8px 10px; border-radius:8px;">
+        <option value="1">Standard Speed (1x scale, draft size)</option>
+        <option value="1.5">High Definition (1.5x scale, balanced design)</option>
+        <option value="2" selected>Ultra-HD Quality (2x scale, ultra crisp text & shapes)</option>
+        <option value="3">Archival Print Premium (3x scale, extreme vector fidelity)</option>
+      </select>
+    </div>
+    <p style="font-size:0.75rem; color:var(--text2); margin-top:8px;">
+      Higher quality multipliers generate razor-sharp vector shapes and texts suitable for large screens and printing, but will take slightly longer to compile and increase the PDF's final size.
+    </p>
+  `;
+  showModal('Export Document PDF', bodyHtml, [
+    { text: 'Cancel', cls: 'btn-s', fn: () => hideModal() },
+    { text: 'Generate', cls: 'btn-p', fn: () => {
+      const qVal = parseFloat(document.getElementById('pdf-quality-select').value);
+      hideModal();
+      exportPDFWithQuality(qVal);
+    }}
+  ]);
+}
+
+async function exportPDFWithQuality(multiplier = 2){
   saveState();
+  showModal('Compiling PDF...', `<p style="font-size:0.85rem;color:var(--text2)">Rendering board slides at ${multiplier}x resolution scale. Please keep this tab active...</p>`, []);
+  
   const{jsPDF}=window.jspdf;
   const doc=new jsPDF({orientation:'landscape',unit:'px',format:[CANVAS_W,CANVAS_H]});
+  
   for(let i=0;i<slides.length;i++){
     const tc=new fabric.StaticCanvas(null,{width:CANVAS_W,height:CANVAS_H,renderOnAddRemove:false});
     await new Promise(res=>tc.loadFromJSON(slides[i].data,res));
@@ -1769,10 +1936,33 @@ async function exportPDF(){
     tc.getObjects().filter(o=>o.isInverted).forEach(o=>{o.filters=[new fabric.Image.filters.Invert()];o.applyFilters();});
     tc.renderAll();
     if(i>0)doc.addPage([CANVAS_W,CANVAS_H],'landscape');
-    doc.addImage(tc.toDataURL({format:'jpeg',quality:.92}),'JPEG',0,0,CANVAS_W,CANVAS_H,undefined,'FAST');
-    tc.dispose();await new Promise(r=>setTimeout(r,10));
+    
+    // Leverage static scaling multiplier parameter natively supported by Fabric.js to increase DPI output
+    const dataUrl = tc.toDataURL({
+      format: 'jpeg', 
+      quality: 0.95, 
+      multiplier: multiplier
+    });
+    
+    doc.addImage(dataUrl,'JPEG',0,0,CANVAS_W,CANVAS_H,undefined,'FAST');
+    tc.dispose();
+    await new Promise(r=>setTimeout(r,15));
   }
-  doc.save('board-slides.pdf');
+  doc.save(`board-slides-${multiplier}x.pdf`);
+  hideModal();
+}
+
+// ── DYNAMIC CANVAS DIMENSIONS SWITCHER
+function updateSlideDimensions(w, h) {
+  CANVAS_W = w;
+  CANVAS_H = h;
+  if (!isInfiniteMode) {
+    canvas.setWidth(CANVAS_W);
+    canvas.setHeight(CANVAS_H);
+    canvas.calcOffset();
+    fitToScreen();
+  }
+  savePrefs();
 }
 
 // ── MATH SYMBOLS EQUATION WRITER
@@ -1889,6 +2079,7 @@ document.getElementById('reset-prefs-btn').onclick=()=>{
   penThick=3;eraserSz=20;smoothnessLevel=2;
   bgPat='plain';bgSpacing=30;
   lightBg='#ffffff';darkBg='#090d16';
+  CANVAS_W=1280;CANVAS_H=720;
 
   document.body.classList.remove('dark');
   document.getElementById('moon-svg').style.display='block';
@@ -1898,6 +2089,10 @@ document.getElementById('reset-prefs-btn').onclick=()=>{
   document.getElementById('smooth-val').textContent=2;
   document.getElementById('eraser-range').value=20;
   document.getElementById('eraser-val').textContent=20;
+
+  const selector = document.getElementById('slide-size-select');
+  if (selector) selector.value = '16:9';
+  document.getElementById('custom-dims-row').style.display = 'none';
 
   applyBg();
   buildStylePopover();
@@ -2029,7 +2224,7 @@ document.getElementById('menu-bg').onclick=()=>{openBgModal();closeAllDropdowns(
 document.getElementById('menu-save').onclick=()=>{saveProject();closeAllDropdowns();};
 document.getElementById('menu-open').onclick=()=>{document.getElementById('open-input').click();closeAllDropdowns();};
 document.getElementById('open-input').onchange=e=>{if(e.target.files[0])loadProject(e.target.files[0]);e.target.value=null;};
-document.getElementById('menu-pdf').onclick=()=>{exportPDF();closeAllDropdowns();};
+document.getElementById('menu-pdf').onclick=()=>{openPdfExportModal();closeAllDropdowns();};
 document.getElementById('menu-theme').onclick=()=>{toggleDark();closeAllDropdowns();};
 document.getElementById('menu-settings').onclick=()=>{openSettings();closeAllDropdowns();};
 document.getElementById('menu-shortcuts').onclick=()=>{document.getElementById('shortcuts-modal').classList.add('show');closeAllDropdowns();};
@@ -2037,6 +2232,38 @@ document.getElementById('menu-shortcuts').onclick=()=>{document.getElementById('
 document.getElementById('sc-close').onclick=()=>document.getElementById('shortcuts-modal').classList.remove('show');
 document.getElementById('shortcuts-modal').onclick=e=>{if(e.target.id==='shortcuts-modal')document.getElementById('shortcuts-modal').classList.remove('show');};
 document.getElementById('add-slide-btn').onclick=()=>addSlide(null,curIdx+1);
+
+// ── ASPECT RATIO EVENT CONTROLLERS
+document.getElementById('slide-size-select').onchange = (e) => {
+  const val = e.target.value;
+  const customRow = document.getElementById('custom-dims-row');
+  if (val === 'custom') {
+    customRow.style.display = 'flex';
+  } else {
+    customRow.style.display = 'none';
+    let w = 1280, h = 720;
+    if (val === '16:9') { w = 1280; h = 720; }
+    else if (val === '4:3') { w = 1024; h = 768; }
+    else if (val === 'A4-P') { w = 794; h = 1123; }
+    else if (val === 'A4-L') { w = 1123; h = 794; }
+    else if (val === 'Letter-P') { w = 816; h = 1056; }
+    else if (val === 'Letter-L') { w = 1056; h = 816; }
+    else if (val === 'Square') { w = 800; h = 800; }
+    updateSlideDimensions(w, h);
+  }
+};
+
+document.getElementById('apply-custom-size-btn').onclick = () => {
+  const wVal = parseInt(document.getElementById('custom-slide-w').value);
+  const hVal = parseInt(document.getElementById('custom-slide-h').value);
+  if (isNaN(wVal) || wVal < 200 || wVal > 4000 || isNaN(hVal) || hVal < 200 || hVal > 4000) {
+    showModal("Invalid Dimensions", "<p style='font-size:.85rem;color:var(--text2)'>Please enter width and height measurements between 200 and 4000 pixels.</p>", [
+      { text: "OK", cls: "btn-p", fn: () => hideModal() }
+    ]);
+    return;
+  }
+  updateSlideDimensions(wVal, hVal);
+};
 
 // ── CLIPBOARD CONTENT INTERCEPTOR (PASTE IMAGE)
 window.addEventListener('paste',e=>{
@@ -2190,10 +2417,6 @@ setTimeout(()=>{
 
 // Center and fit canvas dimensions
 setTimeout(centerCanvas,80);
-window.addEventListener('resize', () => {
-  cachedCanvasWrapRect = null; // Invalidate coordinate cache bounds on browser resize
-  centerCanvas();
-});
 });
 </script>
 </body>
